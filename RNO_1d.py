@@ -5,11 +5,35 @@ import math
 import os
 import platform
 import random
-import textwrap
+import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
+
+if any(flag in sys.argv for flag in ("-h", "--help")):
+    help_parser = argparse.ArgumentParser(description="Train a 1D recurrent neural operator constitutive model.")
+    help_parser.add_argument("--data_path", type=str, default="viscodata_3mat.mat")
+    help_parser.add_argument("--output_dir", type=str, default="outputs")
+    help_parser.add_argument("--epochs", type=int, default=140)
+    help_parser.add_argument("--sweep_epochs", type=int, default=100)
+    help_parser.add_argument("--batch_size", type=int, default=32)
+    help_parser.add_argument("--hidden_dim", type=int, default=8)
+    help_parser.add_argument("--downsample", type=int, default=2)
+    help_parser.add_argument("--device", type=str, default="auto")
+    help_parser.add_argument("--amp_dtype", type=str, default="float16", choices=["float16", "bfloat16"])
+    help_parser.add_argument("--disable_amp", action="store_true")
+    help_parser.add_argument("--num_workers", type=int, default=-1)
+    help_parser.add_argument("--prefetch_factor", type=int, default=4)
+    help_parser.add_argument("--persistent_workers", action="store_true", default=True)
+    help_parser.add_argument("--disable_persistent_workers", action="store_false", dest="persistent_workers")
+    help_parser.add_argument("--deterministic", action="store_true", default=False)
+    help_parser.add_argument("--compile_model", action="store_true", default=True)
+    help_parser.add_argument("--disable_compile_model", action="store_false", dest="compile_model")
+    help_parser.add_argument("--run_hidden_sweep", action="store_true", default=False)
+    help_parser.add_argument("--skip_hidden_sweep", action="store_false", dest="run_hidden_sweep")
+    help_parser.print_help()
+    sys.exit(0)
 
 try:
     import h5py
@@ -24,7 +48,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-import scipy.io
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -52,10 +75,7 @@ class Config:
     amp_dtype: str = "float16"
     hidden_dim: int = 8
     hidden_sweep: Tuple[int, ...] = (1, 2, 3, 4, 6, 8, 12, 16)
-    run_hidden_sweep: bool = True
-    run_baselines: bool = True
-    include_baselines_in_report: bool = False
-    window_size: int = 15
+    run_hidden_sweep: bool = False
     num_workers: int = -1
     prefetch_factor: int = 4
     persistent_workers: bool = True
@@ -64,9 +84,6 @@ class Config:
     figure_dpi: int = 220
     save_pdf_figures: bool = True
     rno_width: int = 64
-    gru_width: int = 32
-    gru_layers: int = 1
-    baseline_width: int = 96
 
 
 DEFAULT_CONFIG = Config()
@@ -139,15 +156,10 @@ def ensure_dirs(output_dir: Path) -> Dict[str, Path]:
         "tables": output_dir / "tables",
         "logs": output_dir / "logs",
         "checkpoints": output_dir / "checkpoints",
-        "report_notes": output_dir / "report_notes",
     }
     for path in paths.values():
         path.mkdir(parents=True, exist_ok=True)
     return paths
-
-
-def write_text(path: Path, text: str) -> None:
-    path.write_text(text.strip() + "\n", encoding="utf-8")
 
 
 def save_json(path: Path, payload: Dict) -> None:
@@ -199,6 +211,8 @@ class MatReader:
 
     def _load_file(self) -> None:
         try:
+            import scipy.io
+
             self.data = scipy.io.loadmat(self.file_path)
             self.old_mat = True
         except NotImplementedError:
@@ -208,6 +222,10 @@ class MatReader:
                 )
             self.data = h5py.File(self.file_path, "r")
             self.old_mat = False
+        except ImportError as exc:
+            raise ImportError(
+                "scipy is required to read MATLAB data. Install with `pip install scipy`."
+            ) from exc
 
     def keys(self) -> List[str]:
         if self.old_mat:
@@ -334,7 +352,7 @@ class RecurrentNeuralOperator1D(nn.Module):
             update_input = torch.cat([current, prev_stress, hidden], dim=-1)
             candidate = torch.tanh(self.hidden_candidate(update_input))
             gate = torch.sigmoid(self.hidden_gate(update_input))
-            # Bounded gated update is more stable than an unconstrained additive step.
+            # Hidden state update is gated so memory evolves smoothly instead of jumping.
             hidden = (1.0 - gate) * hidden + gate * candidate
             hidden = self.hidden_norm(hidden)
             stress = self.output_head(torch.cat([current, hidden], dim=-1))
@@ -342,43 +360,6 @@ class RecurrentNeuralOperator1D(nn.Module):
             prev_stress = stress
 
         return torch.cat(outputs, dim=1)
-
-
-class GRUConstitutiveModel(nn.Module):
-    def __init__(self, feature_dim: int, hidden_dim: int, num_layers: int = 1):
-        super().__init__()
-        self.gru = nn.GRU(
-            input_size=feature_dim,
-            hidden_size=hidden_dim,
-            num_layers=num_layers,
-            batch_first=True,
-        )
-        self.head = MLP([hidden_dim, hidden_dim, 1], activation=nn.GELU)
-
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
-        latent, _ = self.gru(features)
-        return self.head(latent).squeeze(-1)
-
-
-class WindowMLPConstitutiveModel(nn.Module):
-    def __init__(self, feature_dim: int, window_size: int, width: int):
-        super().__init__()
-        self.feature_dim = feature_dim
-        self.window_size = window_size
-        self.head = MLP([feature_dim * window_size, width, width, 1], activation=nn.GELU)
-
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
-        batch_size, time_steps, feature_dim = features.shape
-        windows = []
-        for t in range(time_steps):
-            start = max(0, t - self.window_size + 1)
-            window = features[:, start:t + 1, :]
-            if window.shape[1] < self.window_size:
-                pad = torch.zeros(batch_size, self.window_size - window.shape[1], feature_dim, device=features.device)
-                window = torch.cat([pad, window], dim=1)
-            windows.append(window.reshape(batch_size, -1))
-        stacked = torch.stack(windows, dim=1)
-        return self.head(stacked).squeeze(-1)
 
 
 def combined_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -588,6 +569,7 @@ def compute_per_sample_rmse(y_true: np.ndarray, y_pred: np.ndarray) -> np.ndarra
 
 
 def summarise_split_metrics(y_true_norm: np.ndarray, y_pred_norm: np.ndarray, stress_scaler: StandardScaler) -> Dict[str, float]:
+    # Report both normalized-space errors (optimization scale) and physical-space errors (engineering scale).
     y_true_phys = inverse_stress(y_true_norm, stress_scaler)
     y_pred_phys = inverse_stress(y_pred_norm, stress_scaler)
     metrics_norm = compute_metrics(y_true_norm, y_pred_norm)
@@ -712,44 +694,6 @@ def plot_hidden_sweep(rows: List[Dict[str, object]], out_path: Path, cfg: Config
     save_figure(fig, out_path, cfg.save_pdf_figures, cfg.figure_dpi)
 
 
-def plot_baseline_comparison(rows: List[Dict[str, object]], out_path: Path, cfg: Config) -> None:
-    names = [row["model"] for row in rows]
-    rel_l2 = [float(row["test_rel_l2_phys"]) for row in rows]
-    rmse = [float(row["test_rmse_phys"]) for row in rows]
-    params = [int(row["parameters"]) for row in rows]
-    colors = ["#4C78A8", "#59A14F", "#E15759", "#F28E2B", "#76B7B2"][: len(rows)]
-    fig, axes = plt.subplots(1, 2, figsize=(10.0, 4.2))
-    bars0 = axes[0].bar(names, rel_l2, color=colors)
-    axes[0].set_ylabel("Relative L2 error")
-    axes[0].set_title("Test relative error")
-    axes[0].tick_params(axis="x", rotation=12)
-    bars1 = axes[1].bar(names, rmse, color=colors)
-    axes[1].set_ylabel("RMSE")
-    axes[1].set_title("Test RMSE in physical units")
-    axes[1].tick_params(axis="x", rotation=12)
-    for bar, param_count in zip(bars0, params):
-        axes[0].text(
-            bar.get_x() + bar.get_width() / 2.0,
-            bar.get_height(),
-            f"{param_count}",
-            ha="center",
-            va="bottom",
-            fontsize=8,
-            rotation=90,
-        )
-    for bar, param_count in zip(bars1, params):
-        axes[1].text(
-            bar.get_x() + bar.get_width() / 2.0,
-            bar.get_height(),
-            f"{param_count}",
-            ha="center",
-            va="bottom",
-            fontsize=8,
-            rotation=90,
-        )
-    save_figure(fig, out_path, cfg.save_pdf_figures, cfg.figure_dpi)
-
-
 def select_representative_samples(relative_errors: np.ndarray) -> Tuple[List[int], List[str]]:
     ordering = np.argsort(relative_errors)
     best = int(ordering[0])
@@ -773,62 +717,18 @@ def recommend_hidden_dimension(sweep_rows: List[Dict[str, object]]) -> Dict[str,
         "threshold_rmse_phys": threshold,
         "recommended_hidden_dim": int(chosen["hidden_dim"]),
         "criterion": (
+            # One-standard-error rule selects the simplest model on the validation performance plateau.
             "One-standard-error rule: choose the smallest hidden dimension with validation RMSE "
             "not exceeding (best validation RMSE + its standard error)."
         ),
     }
 
 
-def instantiate_model(
-    model_name: str,
-    cfg: Config,
-    hidden_dim: Optional[int] = None,
-    gru_width: Optional[int] = None,
-    baseline_width: Optional[int] = None,
-) -> nn.Module:
-    if model_name == "RNO":
-        return RecurrentNeuralOperator1D(feature_dim=2, hidden_dim=hidden_dim or cfg.hidden_dim, width=cfg.rno_width)
-    if model_name == "GRU":
-        return GRUConstitutiveModel(feature_dim=2, hidden_dim=gru_width or cfg.gru_width, num_layers=cfg.gru_layers)
-    if model_name == "WindowMLP":
-        return WindowMLPConstitutiveModel(
-            feature_dim=2,
-            window_size=cfg.window_size,
-            width=baseline_width or cfg.baseline_width,
-        )
-    raise ValueError(f"Unknown model '{model_name}'.")
-
-
-def tune_baseline_width(
-    model_name: str,
-    cfg: Config,
-    target_params: int,
-    search_min: int = 8,
-    search_max: int = 256,
-) -> Tuple[int, int]:
-    best_width = search_min
-    best_params = None
-    best_gap = float("inf")
-    for width in range(search_min, search_max + 1):
-        if model_name == "GRU":
-            model = instantiate_model("GRU", cfg, gru_width=width)
-        elif model_name == "WindowMLP":
-            model = instantiate_model("WindowMLP", cfg, baseline_width=width)
-        else:
-            raise ValueError(f"Unsupported baseline model '{model_name}' for width tuning.")
-        params = count_parameters(model)
-        gap = abs(params - target_params)
-        if gap < best_gap:
-            best_gap = gap
-            best_width = width
-            best_params = params
-    if best_params is None:
-        raise RuntimeError(f"Failed to tune baseline width for {model_name}.")
-    return best_width, best_params
+def instantiate_model(cfg: Config, hidden_dim: Optional[int] = None) -> nn.Module:
+    return RecurrentNeuralOperator1D(feature_dim=2, hidden_dim=hidden_dim or cfg.hidden_dim, width=cfg.rno_width)
 
 
 def run_single_experiment(
-    model_name: str,
     cfg: Config,
     device: torch.device,
     features_norm: np.ndarray,
@@ -839,26 +739,14 @@ def run_single_experiment(
     splits: Dict[str, np.ndarray],
     output_paths: Dict[str, Path],
     hidden_dim: Optional[int] = None,
-    gru_width: Optional[int] = None,
-    baseline_width: Optional[int] = None,
     epochs: Optional[int] = None,
     make_figures: bool = True,
     evaluate_test: bool = True,
     tag_context: Optional[str] = None,
 ) -> Dict[str, object]:
-    model = instantiate_model(
-        model_name,
-        cfg,
-        hidden_dim=hidden_dim,
-        gru_width=gru_width,
-        baseline_width=baseline_width,
-    ).to(device)
+    model = instantiate_model(cfg, hidden_dim=hidden_dim).to(device)
     model = maybe_compile_model(model, cfg, device)
-    experiment_tag = model_name if hidden_dim is None else f"{model_name}_h{hidden_dim}"
-    if model_name == "GRU" and gru_width is not None:
-        experiment_tag = f"{experiment_tag}_w{gru_width}"
-    if model_name == "WindowMLP" and baseline_width is not None:
-        experiment_tag = f"{experiment_tag}_w{baseline_width}"
+    experiment_tag = "RNO" if hidden_dim is None else f"RNO_h{hidden_dim}"
     if tag_context:
         experiment_tag = f"{experiment_tag}_{tag_context}"
     train_loader = create_loader(features_norm, stress_norm, splits["train"], cfg, shuffle=True)
@@ -960,7 +848,7 @@ def run_single_experiment(
     if device.type == "cuda":
         torch.cuda.empty_cache()
     return {
-        "model_name": model_name,
+        "model_name": "RNO",
         "experiment_tag": experiment_tag,
         "metrics_rows": metrics_rows,
         "hidden_dim": hidden_dim,
@@ -974,189 +862,6 @@ def run_single_experiment(
         "test_metrics": test_metrics,
         "checkpoint_path": str(checkpoint_path),
     }
-
-
-def write_problem_framing_note(path: Path, dt: float, time_steps: int, downsample: int) -> None:
-    text = f"""
-    Problem 1(a): constitutive model input/output framing
-
-    The learned constitutive model is treated as a causal sequence-to-sequence map at the macroscopic scale.
-    At each time step t_n, the observable input is the current macroscopic strain together with a backward
-    finite-difference approximation to the strain rate. The model output is the current macroscopic stress.
-
-    A recurrent hidden state is evolved alongside the observable loading variables. In mechanics terms, this
-    hidden state plays the role of learned internal variables that encode constitutive memory. The stress at the
-    current step therefore depends on both the current loading state and the accumulated hidden state that stores
-    history effects. This is consistent with the hereditary character expected from viscoelastic composites.
-
-    The data were downsampled by a factor of {downsample}, giving {time_steps} time points and a normalised time
-    increment dt = {dt:.6f}. Downsampling is used only to reduce computational cost while retaining enough temporal
-    resolution for the observed loading histories.
-    """
-    write_text(path, textwrap.dedent(text))
-
-
-def write_hidden_interpretation_note(path: Path, recommendation: Dict[str, object], sweep_rows: List[Dict[str, object]]) -> None:
-    best_row = min(sweep_rows, key=lambda row: float(row["val_rmse_phys"]))
-    text = f"""
-    Problem 1(c): interpretation of the hidden-variable sweep
-
-    In the recurrent neural operator, the hidden state is interpreted as a learned set of internal variables that
-    compactly stores constitutive memory. The hidden dimension is therefore a numerical proxy for the number of
-    macroscopic memory variables required by the data-driven constitutive model.
-
-    The minimum hidden dimension is inferred empirically rather than proved analytically. The sweep compares
-    multiple hidden dimensions under the same training and validation protocol. The selected recommendation is
-    hidden dimension = {recommendation['recommended_hidden_dim']}, using the criterion:
-    {recommendation['criterion']}
-    The hidden-dimension choice is based on validation performance only; the test split is not used for this selection.
-
-    The best validation RMSE obtained anywhere in the sweep was
-    {recommendation['best_val_rmse_phys']:.6e} +/- {recommendation['best_val_rmse_phys_se']:.3e}
-    (mean +/- standard error across validation trajectories), achieved at hidden dimension {int(best_row['hidden_dim'])}.
-    The recommended smaller dimension is preferred when it already lies on the performance plateau, so increasing
-    the hidden-state size further yields only marginal gains relative to the added complexity.
-    """
-    write_text(path, textwrap.dedent(text))
-
-
-def write_experimental_summary(
-    path: Path,
-    cfg: Config,
-    device: torch.device,
-    data_summary: Dict[str, object],
-    main_result: Dict[str, object],
-    baseline_rows: List[Dict[str, object]],
-    recommendation: Optional[Dict[str, object]],
-    include_baselines_in_report: bool,
-) -> None:
-    lines = [
-        "Experimental summary",
-        "",
-        f"Execution device: {device}",
-        f"Random seed: {cfg.seed}",
-        f"Dataset size: {data_summary['num_samples']} trajectories x {data_summary['num_steps']} time steps",
-        f"Downsample factor: {cfg.downsample}",
-        f"Time increment after downsampling: {data_summary['dt']:.6f}",
-        "",
-        f"Main RNO model: hidden_dim={main_result['hidden_dim']} parameters={main_result['parameter_count']}",
-        f"Best validation epoch: {main_result['best_epoch']}",
-        (
-            "Main RNO test metrics (physical units): "
-            f"RMSE={main_result['test_metrics']['rmse_phys']:.6e}, "
-            f"MAE={main_result['test_metrics']['mae_phys']:.6e}, "
-            f"relative L2={main_result['test_metrics']['rel_l2_phys']:.6e}, "
-            f"R^2={main_result['test_metrics']['r2_phys']:.6f}"
-        ),
-    ]
-    if include_baselines_in_report and baseline_rows:
-        lines.extend(["", "Baseline comparison (test split, physical units):"])
-        for row in baseline_rows:
-            lines.append(
-                f"{row['model']}: RMSE={row['test_rmse_phys']:.6e}, "
-                f"relative L2={row['test_rel_l2_phys']:.6e}, R^2={row['test_r2_phys']:.6f}"
-            )
-    if recommendation is not None:
-        lines.extend(
-            [
-                "",
-                "Hidden-state recommendation:",
-                f"Recommended minimum hidden dimension = {recommendation['recommended_hidden_dim']}",
-                f"Selection rule: {recommendation['criterion']}",
-                (
-                    "Sweep protocol: validation-only model selection was used; the test split was not used to "
-                    "choose hidden dimension."
-                ),
-            ]
-        )
-    write_text(path, "\n".join(lines))
-
-
-def write_problem_submission_checklist(
-    path: Path,
-    main_result: Dict[str, object],
-    recommendation: Optional[Dict[str, object]],
-    include_baselines_in_report: bool,
-) -> None:
-    lines = [
-        "Problem 1 (a,b,c) Submission Checklist",
-        "",
-        "Scope lock:",
-        "- Assessed evidence is limited to Problem 1(a), 1(b), and 1(c) for the RNO workflow.",
-        (
-            "- Baselines are treated as out-of-scope for primary evidence."
-            if not include_baselines_in_report
-            else "- Baselines are included as optional contextual evidence only."
-        ),
-        "",
-        "Problem 1(a): constitutive input/output framing",
-        "- Artifact: report_notes/problem1a_constitutive_io.txt",
-        "- Requirement: input state (strain, strain-rate proxy) and output (stress) are explicitly stated.",
-        "",
-        "Problem 1(b): RNO design, training, and evaluation",
-        "- Artifact: tables/main_model_summary.csv",
-        f"- Main run tag: {main_result['experiment_tag']}",
-        "- Requirement: official main-model metrics include train/val/test via the dedicated main metrics artifact.",
-        "",
-        "Problem 1(c): minimum hidden/internal variables",
-        "- Artifacts: tables/hidden_state_sweep.csv, tables/hidden_state_recommendation.json, report_notes/problem1c_hidden_state_interpretation.txt",
-        "- Requirement: selection is validation-only and empirical (one-standard-error criterion).",
-        (
-            f"- Recommended minimum hidden dimension: {recommendation['recommended_hidden_dim']}"
-            if recommendation is not None
-            else "- Recommended minimum hidden dimension: not available (hidden sweep disabled)."
-        ),
-    ]
-    write_text(path, "\n".join(lines))
-
-
-def validate_submission_artifacts(
-    output_paths: Dict[str, Path],
-    main_result: Dict[str, object],
-    hidden_sweep_rows: List[Dict[str, object]],
-    recommendation: Optional[Dict[str, object]],
-) -> Dict[str, object]:
-    checks: Dict[str, object] = {
-        "main_metrics_contains_train_val_test": False,
-        "main_model_summary_matches_main_test_metrics": False,
-        "sweep_does_not_overwrite_main_tag": False,
-        "recommendation_exists": recommendation is not None,
-        "recommendation_matches_one_se_recompute": False,
-    }
-
-    main_splits = {str(row["split"]) for row in main_result["metrics_rows"]}
-    checks["main_metrics_contains_train_val_test"] = main_splits == {"train", "val", "test"}
-
-    summary_rows = list(csv.DictReader((output_paths["tables"] / "main_model_summary.csv").open("r", encoding="utf-8")))
-    if len(summary_rows) == 1:
-        row = summary_rows[0]
-        checks["main_model_summary_matches_main_test_metrics"] = (
-            row["model"] == str(main_result["experiment_tag"])
-            and abs(float(row["test_rmse_phys"]) - float(main_result["test_metrics"]["rmse_phys"])) < 1.0e-12
-            and abs(float(row["test_mae_phys"]) - float(main_result["test_metrics"]["mae_phys"])) < 1.0e-12
-            and abs(float(row["test_rel_l2_phys"]) - float(main_result["test_metrics"]["rel_l2_phys"])) < 1.0e-12
-            and abs(float(row["test_r2_phys"]) - float(main_result["test_metrics"]["r2_phys"])) < 1.0e-12
-        )
-
-    sweep_tags = {f"RNO_h{int(row['hidden_dim'])}_sweep" for row in hidden_sweep_rows}
-    checks["sweep_does_not_overwrite_main_tag"] = str(main_result["experiment_tag"]) not in sweep_tags
-
-    if recommendation is not None and hidden_sweep_rows:
-        best_row = min(hidden_sweep_rows, key=lambda row: float(row["val_rmse_phys"]))
-        threshold = float(best_row["val_rmse_phys"]) + float(best_row["val_rmse_phys_se"])
-        eligible = sorted(
-            int(row["hidden_dim"])
-            for row in hidden_sweep_rows
-            if float(row["val_rmse_phys"]) <= threshold + 1.0e-15
-        )
-        recomputed = eligible[0] if eligible else min(int(row["hidden_dim"]) for row in hidden_sweep_rows)
-        checks["recommendation_matches_one_se_recompute"] = (
-            int(recommendation["recommended_hidden_dim"]) == recomputed
-            and abs(float(recommendation["threshold_rmse_phys"]) - threshold) < 1.0e-12
-        )
-
-    checks["all_pass"] = all(bool(v) for v in checks.values())
-    return checks
 
 
 def parse_args() -> Config:
@@ -1180,13 +885,6 @@ def parse_args() -> Config:
     parser.add_argument("--disable_compile_model", action="store_false", dest="compile_model")
     parser.add_argument("--run_hidden_sweep", action="store_true", default=DEFAULT_CONFIG.run_hidden_sweep)
     parser.add_argument("--skip_hidden_sweep", action="store_false", dest="run_hidden_sweep")
-    parser.add_argument("--run_baselines", action="store_true", default=DEFAULT_CONFIG.run_baselines)
-    parser.add_argument("--skip_baselines", action="store_false", dest="run_baselines")
-    parser.add_argument(
-        "--include_baselines_in_report",
-        action="store_true",
-        default=DEFAULT_CONFIG.include_baselines_in_report,
-    )
     args = parser.parse_args()
 
     cfg = Config()
@@ -1206,8 +904,6 @@ def parse_args() -> Config:
     cfg.deterministic = args.deterministic
     cfg.compile_model = args.compile_model
     cfg.run_hidden_sweep = args.run_hidden_sweep
-    cfg.run_baselines = args.run_baselines
-    cfg.include_baselines_in_report = args.include_baselines_in_report
     return cfg
 
 
@@ -1255,9 +951,11 @@ def main() -> None:
     stress_scaler = StandardScaler()
     rate_scaler = StandardScaler()
 
+    # Fit normalization using train split only to avoid leakage into validation/test.
     strain_train = strain[splits["train"]].reshape(-1, 1)
     stress_train = stress[splits["train"]].reshape(-1, 1)
     rate_train = np.zeros_like(strain[splits["train"]], dtype=np.float32)
+    # Strain-rate proxy from backward finite differences.
     rate_train[:, 1:] = (strain[splits["train"], 1:] - strain[splits["train"], :-1]) / dt
 
     strain_scaler.fit(strain_train)
@@ -1295,16 +993,8 @@ def main() -> None:
     }
     save_json(output_paths["logs"] / "data_summary.json", data_summary)
 
-    write_problem_framing_note(
-        output_paths["report_notes"] / "problem1a_constitutive_io.txt",
-        dt=dt,
-        time_steps=num_steps,
-        downsample=cfg.downsample,
-    )
-
     print(f"[{timestamp()}] Training main RNO model with hidden_dim={cfg.hidden_dim}")
     main_result = run_single_experiment(
-        model_name="RNO",
         cfg=cfg,
         device=device,
         features_norm=features_norm,
@@ -1321,81 +1011,6 @@ def main() -> None:
         tag_context="main",
     )
 
-    baseline_summary_rows: List[Dict[str, object]] = []
-    if cfg.run_baselines:
-        target_params = int(main_result["parameter_count"])
-        width_table = []
-        tuned_mlp_width, tuned_mlp_params = tune_baseline_width("WindowMLP", cfg, target_params=target_params)
-        tuned_gru_width, tuned_gru_params = tune_baseline_width("GRU", cfg, target_params=target_params)
-        width_table.append(
-            {
-                "model": "WindowMLP",
-                "width": tuned_mlp_width,
-                "parameters": tuned_mlp_params,
-                "target_parameters": target_params,
-                "mismatch_fraction": abs(tuned_mlp_params - target_params) / max(target_params, 1),
-            }
-        )
-        width_table.append(
-            {
-                "model": "GRU",
-                "width": tuned_gru_width,
-                "parameters": tuned_gru_params,
-                "target_parameters": target_params,
-                "mismatch_fraction": abs(tuned_gru_params - target_params) / max(target_params, 1),
-            }
-        )
-        save_csv(output_paths["tables"] / "baseline_width_tuning.csv", width_table)
-
-        baseline_specs = [
-            ("WindowMLP", {"baseline_width": tuned_mlp_width}),
-            ("GRU", {"gru_width": tuned_gru_width}),
-        ]
-        for baseline_name, extra_kwargs in baseline_specs:
-            print(
-                f"[{timestamp()}] Training baseline {baseline_name} "
-                f"(fair-width setting: {width_table[0 if baseline_name == 'WindowMLP' else 1]['width']})"
-            )
-            result = run_single_experiment(
-                model_name=baseline_name,
-                cfg=cfg,
-                device=device,
-                features_norm=features_norm,
-                stress_norm=stress_norm,
-                stress_scaler=stress_scaler,
-                strain_phys=strain,
-                time_axis=time_axis,
-                splits=splits,
-                output_paths=output_paths,
-                epochs=cfg.epochs,
-                make_figures=False,
-                evaluate_test=True,
-                tag_context="baseline",
-                **extra_kwargs,
-            )
-            baseline_summary_rows.append(
-                {
-                    "model": result["experiment_tag"],
-                    "parameters": result["parameter_count"],
-                    "test_rmse_phys": result["test_metrics"]["rmse_phys"],
-                    "test_rel_l2_phys": result["test_metrics"]["rel_l2_phys"],
-                    "test_r2_phys": result["test_metrics"]["r2_phys"],
-                }
-            )
-
-        baseline_summary_rows.insert(
-            0,
-            {
-                "model": main_result["experiment_tag"],
-                "parameters": main_result["parameter_count"],
-                "test_rmse_phys": main_result["test_metrics"]["rmse_phys"],
-                "test_rel_l2_phys": main_result["test_metrics"]["rel_l2_phys"],
-                "test_r2_phys": main_result["test_metrics"]["r2_phys"],
-            },
-        )
-        save_csv(output_paths["tables"] / "baseline_comparison.csv", baseline_summary_rows)
-        plot_baseline_comparison(baseline_summary_rows, output_paths["figures"] / "baseline_comparison.png", cfg)
-
     hidden_sweep_rows: List[Dict[str, object]] = []
     recommendation = None
     if cfg.run_hidden_sweep:
@@ -1403,7 +1018,6 @@ def main() -> None:
         sweep_iter = maybe_tqdm(cfg.hidden_sweep, desc="Hidden sweep", leave=False, dynamic_ncols=True)
         for hidden_dim in sweep_iter:
             result = run_single_experiment(
-                model_name="RNO",
                 cfg=cfg,
                 device=device,
                 features_norm=features_norm,
@@ -1436,22 +1050,6 @@ def main() -> None:
         plot_hidden_sweep(hidden_sweep_rows, output_paths["figures"] / "hidden_state_sweep.png", cfg)
         recommendation = recommend_hidden_dimension(hidden_sweep_rows)
         save_json(output_paths["tables"] / "hidden_state_recommendation.json", recommendation)
-        write_hidden_interpretation_note(
-            output_paths["report_notes"] / "problem1c_hidden_state_interpretation.txt",
-            recommendation=recommendation,
-            sweep_rows=hidden_sweep_rows,
-        )
-
-    write_experimental_summary(
-        output_paths["report_notes"] / "experimental_summary.txt",
-        cfg=cfg,
-        device=device,
-        data_summary=data_summary,
-        main_result=main_result,
-        baseline_rows=baseline_summary_rows,
-        recommendation=recommendation,
-        include_baselines_in_report=cfg.include_baselines_in_report,
-    )
 
     save_csv(
         output_paths["tables"] / "main_model_summary.csv",
@@ -1469,20 +1067,6 @@ def main() -> None:
     )
     save_csv(output_paths["tables"] / "rno_submission_main_metrics.csv", main_result["metrics_rows"])
 
-    write_problem_submission_checklist(
-        output_paths["report_notes"] / "problem1_submission_checklist.txt",
-        main_result=main_result,
-        recommendation=recommendation,
-        include_baselines_in_report=cfg.include_baselines_in_report,
-    )
-    submission_checks = validate_submission_artifacts(
-        output_paths=output_paths,
-        main_result=main_result,
-        hidden_sweep_rows=hidden_sweep_rows,
-        recommendation=recommendation,
-    )
-    save_json(output_paths["tables"] / "submission_consistency_checks.json", submission_checks)
-
     print("")
     print("=== Coursework summary ===")
     print(
@@ -1491,13 +1075,6 @@ def main() -> None:
         f"relative L2={main_result['test_metrics']['rel_l2_phys']:.6e}, "
         f"R^2={main_result['test_metrics']['r2_phys']:.6f}"
     )
-    if baseline_summary_rows:
-        print("Baseline comparison:")
-        for row in baseline_summary_rows:
-            print(
-                f"  {row['model']}: RMSE={row['test_rmse_phys']:.6e}, "
-                f"relative L2={row['test_rel_l2_phys']:.6e}, R^2={row['test_r2_phys']:.6f}"
-            )
     if recommendation is not None:
         print(
             f"Recommended minimum hidden dimension: {recommendation['recommended_hidden_dim']} "
