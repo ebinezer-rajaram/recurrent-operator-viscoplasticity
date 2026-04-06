@@ -2,6 +2,8 @@ import argparse
 import csv
 import json
 import math
+import os
+import platform
 import random
 import textwrap
 import time
@@ -13,6 +15,10 @@ try:
     import h5py
 except ImportError:
     h5py = None
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
 import matplotlib
 
 matplotlib.use("Agg")
@@ -42,12 +48,19 @@ class Config:
     weight_decay: float = 1.0e-4
     patience: int = 20
     grad_clip: float = 1.0
+    use_amp: bool = True
+    amp_dtype: str = "float16"
     hidden_dim: int = 8
     hidden_sweep: Tuple[int, ...] = (1, 2, 3, 4, 6, 8, 12, 16)
     run_hidden_sweep: bool = True
     run_baselines: bool = True
+    include_baselines_in_report: bool = False
     window_size: int = 15
-    num_workers: int = 0
+    num_workers: int = -1
+    prefetch_factor: int = 4
+    persistent_workers: bool = True
+    deterministic: bool = False
+    compile_model: bool = True
     figure_dpi: int = 220
     save_pdf_figures: bool = True
     rno_width: int = 64
@@ -59,23 +72,64 @@ class Config:
 DEFAULT_CONFIG = Config()
 
 
-def set_global_seed(seed: int) -> None:
+def maybe_tqdm(iterable, **kwargs):
+    if tqdm is None:
+        return iterable
+    return tqdm(iterable, **kwargs)
+
+
+def set_global_seed(seed: int, deterministic: bool) -> None:
+    # Required for deterministic CuBLAS kernels on CUDA >= 10.2.
+    if deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = bool(deterministic)
+    torch.backends.cudnn.benchmark = not bool(deterministic)
     try:
-        torch.use_deterministic_algorithms(True)
+        torch.use_deterministic_algorithms(bool(deterministic))
     except Exception:
         pass
+
+
+def resolve_num_workers(cfg: Config) -> int:
+    if cfg.num_workers >= 0:
+        return cfg.num_workers
+    cpu_count = os.cpu_count() or 1
+    return min(8, max(1, cpu_count // 2))
+
+
+def maybe_compile_model(model: nn.Module, cfg: Config, device: torch.device) -> nn.Module:
+    if not cfg.compile_model or device.type != "cuda":
+        return model
+    if not hasattr(torch, "compile"):
+        return model
+    try:
+        return torch.compile(model, mode="reduce-overhead")
+    except Exception as exc:
+        print(f"[{timestamp()}] Warning: torch.compile failed ({exc}). Falling back to eager mode.")
+        return model
 
 
 def resolve_device(device_arg: str) -> torch.device:
     if device_arg == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(device_arg)
+
+
+def resolve_amp_dtype(name: str) -> torch.dtype:
+    key = name.lower()
+    if key in ("fp16", "float16", "half"):
+        return torch.float16
+    if key in ("bf16", "bfloat16"):
+        return torch.bfloat16
+    raise ValueError(f"Unsupported AMP dtype '{name}'. Use 'float16' or 'bfloat16'.")
+
+
+def supports_bfloat16(device: torch.device) -> bool:
+    return bool(device.type == "cuda" and torch.cuda.is_bf16_supported())
 
 
 def ensure_dirs(output_dir: Path) -> Dict[str, Path]:
@@ -117,6 +171,23 @@ def count_parameters(model: nn.Module) -> int:
 
 def timestamp() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def gather_environment(device: torch.device) -> Dict[str, object]:
+    env = {
+        "python_version": platform.python_version(),
+        "platform": platform.platform(),
+        "torch_version": torch.__version__,
+        "numpy_version": np.__version__,
+        "device": str(device),
+        "cuda_available": torch.cuda.is_available(),
+        "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
+        "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
+    }
+    if torch.cuda.is_available():
+        env["cuda_version"] = torch.version.cuda
+        env["gpu_name"] = torch.cuda.get_device_name(device)
+    return env
 
 
 class MatReader:
@@ -243,8 +314,10 @@ class RecurrentNeuralOperator1D(nn.Module):
         super().__init__()
         self.feature_dim = feature_dim
         self.hidden_dim = hidden_dim
-        self.hidden_encoder = MLP([feature_dim + 1 + hidden_dim, width, width, hidden_dim], activation=nn.GELU)
+        self.hidden_candidate = MLP([feature_dim + 1 + hidden_dim, width, width, hidden_dim], activation=nn.GELU)
+        self.hidden_gate = MLP([feature_dim + 1 + hidden_dim, width, hidden_dim], activation=nn.GELU)
         self.output_head = MLP([feature_dim + hidden_dim, width, width, 1], activation=nn.GELU)
+        self.hidden_norm = nn.LayerNorm(hidden_dim)
         self.initial_head = MLP([feature_dim + hidden_dim, width, width, 1], activation=nn.GELU)
 
     def init_hidden(self, batch_size: int, device: torch.device) -> torch.Tensor:
@@ -254,15 +327,16 @@ class RecurrentNeuralOperator1D(nn.Module):
         batch_size, time_steps, _ = features.shape
         hidden = self.init_hidden(batch_size, features.device)
         outputs: List[torch.Tensor] = []
-
         prev_stress = self.initial_head(torch.cat([features[:, 0, :], hidden], dim=-1))
-        outputs.append(prev_stress)
 
-        for t in range(1, time_steps):
+        for t in range(time_steps):
             current = features[:, t, :]
             update_input = torch.cat([current, prev_stress, hidden], dim=-1)
-            delta_h = self.hidden_encoder(update_input)
-            hidden = hidden + 0.1 * torch.tanh(delta_h)
+            candidate = torch.tanh(self.hidden_candidate(update_input))
+            gate = torch.sigmoid(self.hidden_gate(update_input))
+            # Bounded gated update is more stable than an unconstrained additive step.
+            hidden = (1.0 - gate) * hidden + gate * candidate
+            hidden = self.hidden_norm(hidden)
             stress = self.output_head(torch.cat([current, hidden], dim=-1))
             outputs.append(stress)
             prev_stress = stress
@@ -310,36 +384,58 @@ class WindowMLPConstitutiveModel(nn.Module):
 def combined_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     mse = F.mse_loss(pred, target)
     rel = torch.norm(pred - target, dim=1) / (torch.norm(target, dim=1) + 1.0e-8)
-    return mse + 0.1 * rel.mean()
+    smooth = F.smooth_l1_loss(pred, target, beta=0.05)
+    return mse + 0.1 * rel.mean() + 0.05 * smooth
 
 
-def create_loader(features: np.ndarray, targets: np.ndarray, indices: np.ndarray, cfg: Config, shuffle: bool) -> DataLoader:
+def create_loader(
+    features: np.ndarray,
+    targets: np.ndarray,
+    indices: np.ndarray,
+    cfg: Config,
+    shuffle: bool,
+    batch_size: Optional[int] = None,
+) -> DataLoader:
     dataset = TensorDataset(
         torch.from_numpy(features[indices]).float(),
         torch.from_numpy(targets[indices]).float(),
     )
     generator = torch.Generator()
     generator.manual_seed(cfg.seed)
+    num_workers = resolve_num_workers(cfg)
+    loader_kwargs = {}
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = max(2, int(cfg.prefetch_factor))
+        loader_kwargs["persistent_workers"] = bool(cfg.persistent_workers)
     return DataLoader(
         dataset,
-        batch_size=cfg.batch_size,
+        batch_size=batch_size or cfg.batch_size,
         shuffle=shuffle,
-        num_workers=cfg.num_workers,
+        num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
         generator=generator,
+        **loader_kwargs,
     )
 
 
-def evaluate_loss(model: nn.Module, loader: DataLoader, device: torch.device) -> float:
+def evaluate_loss(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    use_amp: bool,
+    amp_dtype: torch.dtype,
+) -> float:
     model.eval()
     total_loss = 0.0
     total_samples = 0
+    use_amp_eval = bool(use_amp and device.type == "cuda")
     with torch.no_grad():
         for features, targets in loader:
-            features = features.to(device)
-            targets = targets.to(device)
-            predictions = model(features)
-            loss = combined_loss(predictions, targets)
+            features = features.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp_eval):
+                predictions = model(features)
+                loss = combined_loss(predictions, targets)
             total_loss += loss.item() * features.size(0)
             total_samples += features.size(0)
     return total_loss / max(total_samples, 1)
@@ -366,25 +462,47 @@ def train_model(
     best_val = float("inf")
     best_epoch = -1
     patience_counter = 0
+    use_amp_train = bool(cfg.use_amp and device.type == "cuda")
+    amp_dtype = resolve_amp_dtype(cfg.amp_dtype)
+    if amp_dtype == torch.bfloat16 and not supports_bfloat16(device):
+        amp_dtype = torch.float16
+    scaler_enabled = use_amp_train and amp_dtype == torch.float16
+    try:
+        scaler = torch.amp.GradScaler(device.type, enabled=scaler_enabled)
+    except Exception:
+        scaler = torch.cuda.amp.GradScaler(enabled=scaler_enabled)
 
-    for epoch in range(1, epochs + 1):
+    epoch_iter = maybe_tqdm(range(1, epochs + 1), desc="Training epochs", leave=False, dynamic_ncols=True)
+    for epoch in epoch_iter:
         model.train()
         running_loss = 0.0
         total_samples = 0
-        for features, targets in train_loader:
+        train_iter = maybe_tqdm(
+            train_loader,
+            desc=f"Epoch {epoch:03d}",
+            leave=False,
+            dynamic_ncols=True,
+            total=len(train_loader),
+        )
+        for features, targets in train_iter:
             features = features.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
-            predictions = model(features)
-            loss = combined_loss(predictions, targets)
-            loss.backward()
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp_train):
+                predictions = model(features)
+                loss = combined_loss(predictions, targets)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=cfg.grad_clip)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             running_loss += loss.item() * features.size(0)
             total_samples += features.size(0)
+            if tqdm is not None:
+                train_iter.set_postfix(loss=f"{loss.item():.4e}", lr=f"{optimizer.param_groups[0]['lr']:.2e}")
 
         train_loss = running_loss / max(total_samples, 1)
-        val_loss = evaluate_loss(model, val_loader, device)
+        val_loss = evaluate_loss(model, val_loader, device, use_amp=cfg.use_amp, amp_dtype=amp_dtype)
         scheduler.step(val_loss)
         current_lr = optimizer.param_groups[0]["lr"]
 
@@ -392,6 +510,8 @@ def train_model(
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
         history["lr"].append(current_lr)
+        if tqdm is not None:
+            epoch_iter.set_postfix(train=f"{train_loss:.4e}", val=f"{val_loss:.4e}", lr=f"{current_lr:.2e}")
 
         if val_loss < best_val - 1.0e-6:
             best_val = val_loss
@@ -425,13 +545,23 @@ def inverse_stress(stress_norm: np.ndarray, scaler: StandardScaler) -> np.ndarra
     return restored.reshape(stress_norm.shape)
 
 
-def collect_predictions(model: nn.Module, features: np.ndarray, device: torch.device, batch_size: int = 64) -> np.ndarray:
+def collect_predictions(
+    model: nn.Module,
+    features: np.ndarray,
+    device: torch.device,
+    batch_size: int = 64,
+    use_amp: bool = False,
+    amp_dtype: torch.dtype = torch.float16,
+) -> np.ndarray:
     model.eval()
     outputs = []
+    use_amp_eval = bool(use_amp and device.type == "cuda")
     with torch.no_grad():
         for start in range(0, len(features), batch_size):
-            batch = torch.from_numpy(features[start:start + batch_size]).float().to(device)
-            outputs.append(model(batch).cpu().numpy())
+            batch = torch.from_numpy(features[start:start + batch_size]).float().to(device, non_blocking=True)
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp_eval):
+                pred = model(batch)
+            outputs.append(pred.cpu().numpy())
     return np.concatenate(outputs, axis=0)
 
 
@@ -451,6 +581,10 @@ def compute_per_sample_relative_error(y_true: np.ndarray, y_pred: np.ndarray) ->
     numerator = np.linalg.norm(y_pred - y_true, axis=1)
     denominator = np.linalg.norm(y_true, axis=1) + 1.0e-12
     return numerator / denominator
+
+
+def compute_per_sample_rmse(y_true: np.ndarray, y_pred: np.ndarray) -> np.ndarray:
+    return np.sqrt(np.mean((y_pred - y_true) ** 2, axis=1))
 
 
 def summarise_split_metrics(y_true_norm: np.ndarray, y_pred_norm: np.ndarray, stress_scaler: StandardScaler) -> Dict[str, float]:
@@ -513,25 +647,40 @@ def plot_trajectory_examples(
     cfg: Config,
 ) -> None:
     for sample_index, label in zip(sample_indices, labels):
-        fig, axes = plt.subplots(1, 2, figsize=(11.0, 4.2))
-        axes[0].plot(time_axis, stress_true_phys[sample_index], label="True stress")
-        axes[0].plot(time_axis, stress_pred_phys[sample_index], "--", label="Predicted stress")
+        fig, axes = plt.subplots(1, 3, figsize=(14.0, 4.0))
+        pred = stress_pred_phys[sample_index]
+        truth = stress_true_phys[sample_index]
+        residual = pred - truth
+        axes[0].plot(time_axis, truth, label="True stress", color="#1f77b4")
+        axes[0].plot(time_axis, pred, "--", label="Predicted stress", color="#d62728")
         axes[0].set_xlabel("Normalised time")
         axes[0].set_ylabel("Macroscopic stress")
         axes[0].set_title(f"{label.capitalize()} case: stress history")
         axes[0].legend(frameon=True)
-        axes[1].plot(strain_phys[sample_index], stress_true_phys[sample_index], label="True loop")
-        axes[1].plot(strain_phys[sample_index], stress_pred_phys[sample_index], "--", label="Predicted loop")
+        axes[1].plot(strain_phys[sample_index], truth, label="True loop", color="#1f77b4")
+        axes[1].plot(strain_phys[sample_index], pred, "--", label="Predicted loop", color="#d62728")
         axes[1].set_xlabel("Macroscopic strain")
         axes[1].set_ylabel("Macroscopic stress")
         axes[1].set_title(f"{label.capitalize()} case: stress-strain loop")
         axes[1].legend(frameon=True)
+        axes[2].plot(time_axis, residual, color="#2ca02c")
+        axes[2].axhline(0.0, color="k", linewidth=1.0, linestyle="--")
+        axes[2].set_xlabel("Normalised time")
+        axes[2].set_ylabel("Prediction residual")
+        axes[2].set_title(f"{label.capitalize()} case: residual")
         save_figure(fig, fig_dir / f"{prefix}_{label}_sample_{sample_index:03d}.png", cfg.save_pdf_figures, cfg.figure_dpi)
 
 
 def plot_parity(y_true_phys: np.ndarray, y_pred_phys: np.ndarray, out_path: Path, cfg: Config) -> None:
     fig, ax = plt.subplots(figsize=(5.4, 5.4))
-    ax.scatter(y_true_phys.reshape(-1), y_pred_phys.reshape(-1), s=8, alpha=0.25, edgecolors="none")
+    hexbin = ax.hexbin(
+        y_true_phys.reshape(-1),
+        y_pred_phys.reshape(-1),
+        gridsize=70,
+        mincnt=1,
+        bins="log",
+        cmap="viridis",
+    )
     lower = float(min(y_true_phys.min(), y_pred_phys.min()))
     upper = float(max(y_true_phys.max(), y_pred_phys.max()))
     ax.plot([lower, upper], [lower, upper], "k--", linewidth=1.5, label="Ideal agreement")
@@ -539,20 +688,27 @@ def plot_parity(y_true_phys: np.ndarray, y_pred_phys: np.ndarray, out_path: Path
     ax.set_ylabel("Predicted stress")
     ax.set_title("Parity plot on the held-out test set")
     ax.legend(frameon=True)
+    cbar = fig.colorbar(hexbin, ax=ax)
+    cbar.set_label("log10(count)")
     save_figure(fig, out_path, cfg.save_pdf_figures, cfg.figure_dpi)
 
 
 def plot_hidden_sweep(rows: List[Dict[str, object]], out_path: Path, cfg: Config) -> None:
     dims = [int(row["hidden_dim"]) for row in rows]
     val_rmse = [float(row["val_rmse_phys"]) for row in rows]
-    test_rmse = [float(row["test_rmse_phys"]) for row in rows]
+    val_se = [float(row["val_rmse_phys_se"]) for row in rows]
+    params = [float(row["parameters"]) for row in rows]
     fig, ax = plt.subplots()
-    ax.plot(dims, val_rmse, marker="o", label="Validation RMSE")
-    ax.plot(dims, test_rmse, marker="s", label="Test RMSE")
+    ax.errorbar(dims, val_rmse, yerr=val_se, marker="o", capsize=3.0, label="Validation RMSE ± SE")
     ax.set_xlabel("Hidden/internal variable dimension")
     ax.set_ylabel("RMSE in physical stress units")
-    ax.set_title("Hidden-state sweep for the recurrent neural operator")
-    ax.legend(frameon=True)
+    ax.set_title("Hidden-state sweep (validation-only model selection)")
+    ax2 = ax.twinx()
+    ax2.plot(dims, params, marker="s", linestyle="--", color="#555555", label="Trainable parameters")
+    ax2.set_ylabel("Parameter count")
+    handles_1, labels_1 = ax.get_legend_handles_labels()
+    handles_2, labels_2 = ax2.get_legend_handles_labels()
+    ax.legend(handles_1 + handles_2, labels_1 + labels_2, frameon=True, loc="best")
     save_figure(fig, out_path, cfg.save_pdf_figures, cfg.figure_dpi)
 
 
@@ -560,15 +716,37 @@ def plot_baseline_comparison(rows: List[Dict[str, object]], out_path: Path, cfg:
     names = [row["model"] for row in rows]
     rel_l2 = [float(row["test_rel_l2_phys"]) for row in rows]
     rmse = [float(row["test_rmse_phys"]) for row in rows]
+    params = [int(row["parameters"]) for row in rows]
+    colors = ["#4C78A8", "#59A14F", "#E15759", "#F28E2B", "#76B7B2"][: len(rows)]
     fig, axes = plt.subplots(1, 2, figsize=(10.0, 4.2))
-    axes[0].bar(names, rel_l2, color=["#4C78A8", "#59A14F", "#E15759"])
+    bars0 = axes[0].bar(names, rel_l2, color=colors)
     axes[0].set_ylabel("Relative L2 error")
     axes[0].set_title("Test relative error")
     axes[0].tick_params(axis="x", rotation=12)
-    axes[1].bar(names, rmse, color=["#4C78A8", "#59A14F", "#E15759"])
+    bars1 = axes[1].bar(names, rmse, color=colors)
     axes[1].set_ylabel("RMSE")
     axes[1].set_title("Test RMSE in physical units")
     axes[1].tick_params(axis="x", rotation=12)
+    for bar, param_count in zip(bars0, params):
+        axes[0].text(
+            bar.get_x() + bar.get_width() / 2.0,
+            bar.get_height(),
+            f"{param_count}",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+            rotation=90,
+        )
+    for bar, param_count in zip(bars1, params):
+        axes[1].text(
+            bar.get_x() + bar.get_width() / 2.0,
+            bar.get_height(),
+            f"{param_count}",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+            rotation=90,
+        )
     save_figure(fig, out_path, cfg.save_pdf_figures, cfg.figure_dpi)
 
 
@@ -580,30 +758,73 @@ def select_representative_samples(relative_errors: np.ndarray) -> Tuple[List[int
     return [best, median, worst], ["best", "median", "worst"]
 
 
-def recommend_hidden_dimension(sweep_rows: List[Dict[str, object]], tolerance: float = 0.02) -> Dict[str, object]:
-    best_val = min(float(row["val_rmse_phys"]) for row in sweep_rows)
-    threshold = best_val * (1.0 + tolerance)
+def recommend_hidden_dimension(sweep_rows: List[Dict[str, object]]) -> Dict[str, object]:
+    if not sweep_rows:
+        raise ValueError("Hidden-state sweep rows are required for recommendation.")
+    best_row = min(sweep_rows, key=lambda row: float(row["val_rmse_phys"]))
+    best_mean = float(best_row["val_rmse_phys"])
+    best_se = float(best_row["val_rmse_phys_se"])
+    threshold = best_mean + best_se
     eligible = [row for row in sweep_rows if float(row["val_rmse_phys"]) <= threshold]
     chosen = min(eligible, key=lambda row: int(row["hidden_dim"]))
     return {
-        "best_val_rmse_phys": best_val,
+        "best_val_rmse_phys": best_mean,
+        "best_val_rmse_phys_se": best_se,
         "threshold_rmse_phys": threshold,
         "recommended_hidden_dim": int(chosen["hidden_dim"]),
         "criterion": (
-            "Smallest hidden dimension whose validation RMSE lies within "
-            f"{100.0 * tolerance:.1f}% of the best validation RMSE."
+            "One-standard-error rule: choose the smallest hidden dimension with validation RMSE "
+            "not exceeding (best validation RMSE + its standard error)."
         ),
     }
 
 
-def instantiate_model(model_name: str, cfg: Config, hidden_dim: Optional[int] = None) -> nn.Module:
+def instantiate_model(
+    model_name: str,
+    cfg: Config,
+    hidden_dim: Optional[int] = None,
+    gru_width: Optional[int] = None,
+    baseline_width: Optional[int] = None,
+) -> nn.Module:
     if model_name == "RNO":
         return RecurrentNeuralOperator1D(feature_dim=2, hidden_dim=hidden_dim or cfg.hidden_dim, width=cfg.rno_width)
     if model_name == "GRU":
-        return GRUConstitutiveModel(feature_dim=2, hidden_dim=cfg.gru_width, num_layers=cfg.gru_layers)
+        return GRUConstitutiveModel(feature_dim=2, hidden_dim=gru_width or cfg.gru_width, num_layers=cfg.gru_layers)
     if model_name == "WindowMLP":
-        return WindowMLPConstitutiveModel(feature_dim=2, window_size=cfg.window_size, width=cfg.baseline_width)
+        return WindowMLPConstitutiveModel(
+            feature_dim=2,
+            window_size=cfg.window_size,
+            width=baseline_width or cfg.baseline_width,
+        )
     raise ValueError(f"Unknown model '{model_name}'.")
+
+
+def tune_baseline_width(
+    model_name: str,
+    cfg: Config,
+    target_params: int,
+    search_min: int = 8,
+    search_max: int = 256,
+) -> Tuple[int, int]:
+    best_width = search_min
+    best_params = None
+    best_gap = float("inf")
+    for width in range(search_min, search_max + 1):
+        if model_name == "GRU":
+            model = instantiate_model("GRU", cfg, gru_width=width)
+        elif model_name == "WindowMLP":
+            model = instantiate_model("WindowMLP", cfg, baseline_width=width)
+        else:
+            raise ValueError(f"Unsupported baseline model '{model_name}' for width tuning.")
+        params = count_parameters(model)
+        gap = abs(params - target_params)
+        if gap < best_gap:
+            best_gap = gap
+            best_width = width
+            best_params = params
+    if best_params is None:
+        raise RuntimeError(f"Failed to tune baseline width for {model_name}.")
+    return best_width, best_params
 
 
 def run_single_experiment(
@@ -618,14 +839,34 @@ def run_single_experiment(
     splits: Dict[str, np.ndarray],
     output_paths: Dict[str, Path],
     hidden_dim: Optional[int] = None,
+    gru_width: Optional[int] = None,
+    baseline_width: Optional[int] = None,
     epochs: Optional[int] = None,
     make_figures: bool = True,
+    evaluate_test: bool = True,
+    tag_context: Optional[str] = None,
 ) -> Dict[str, object]:
-    model = instantiate_model(model_name, cfg, hidden_dim=hidden_dim).to(device)
+    model = instantiate_model(
+        model_name,
+        cfg,
+        hidden_dim=hidden_dim,
+        gru_width=gru_width,
+        baseline_width=baseline_width,
+    ).to(device)
+    model = maybe_compile_model(model, cfg, device)
     experiment_tag = model_name if hidden_dim is None else f"{model_name}_h{hidden_dim}"
+    if model_name == "GRU" and gru_width is not None:
+        experiment_tag = f"{experiment_tag}_w{gru_width}"
+    if model_name == "WindowMLP" and baseline_width is not None:
+        experiment_tag = f"{experiment_tag}_w{baseline_width}"
+    if tag_context:
+        experiment_tag = f"{experiment_tag}_{tag_context}"
     train_loader = create_loader(features_norm, stress_norm, splits["train"], cfg, shuffle=True)
     val_loader = create_loader(features_norm, stress_norm, splits["val"], cfg, shuffle=False)
     checkpoint_path = output_paths["checkpoints"] / f"{experiment_tag}.pt"
+    amp_dtype = resolve_amp_dtype(cfg.amp_dtype)
+    if amp_dtype == torch.bfloat16 and not supports_bfloat16(device):
+        amp_dtype = torch.float16
 
     result = train_model(
         model=model,
@@ -639,9 +880,18 @@ def run_single_experiment(
 
     predictions = {}
     metrics_rows = []
-    for split_name, split_indices in splits.items():
+    split_names = ["train", "val"] + (["test"] if evaluate_test else [])
+    for split_name in split_names:
+        split_indices = splits[split_name]
         y_true_norm = stress_norm[split_indices]
-        y_pred_norm = collect_predictions(model, features_norm[split_indices], device, batch_size=cfg.batch_size)
+        y_pred_norm = collect_predictions(
+            model,
+            features_norm[split_indices],
+            device,
+            batch_size=cfg.batch_size,
+            use_amp=cfg.use_amp,
+            amp_dtype=amp_dtype,
+        )
         predictions[split_name] = {"y_true_norm": y_true_norm, "y_pred_norm": y_pred_norm}
         metric_summary = summarise_split_metrics(y_true_norm, y_pred_norm, stress_scaler)
         row = {"model": experiment_tag, "split": split_name}
@@ -667,7 +917,7 @@ def run_single_experiment(
     )
     save_csv(output_paths["tables"] / f"{experiment_tag}_metrics.csv", metrics_rows)
 
-    if make_figures:
+    if make_figures and evaluate_test:
         plot_loss_curves(
             result["history"],
             title=f"{experiment_tag}: training history",
@@ -698,16 +948,29 @@ def run_single_experiment(
             cfg=cfg,
         )
 
-    test_metrics = next(row for row in metrics_rows if row["split"] == "test")
+    val_pred_phys = inverse_stress(predictions["val"]["y_pred_norm"], stress_scaler)
+    val_true_phys = inverse_stress(predictions["val"]["y_true_norm"], stress_scaler)
+    val_rmse_per_sample = compute_per_sample_rmse(val_true_phys, val_pred_phys)
+    val_rmse_mean = float(val_rmse_per_sample.mean())
+    val_rmse_se = float(val_rmse_per_sample.std(ddof=1) / math.sqrt(max(1, len(val_rmse_per_sample)))) if len(val_rmse_per_sample) > 1 else 0.0
+
+    test_metrics = next((row for row in metrics_rows if row["split"] == "test"), None)
     val_metrics = next(row for row in metrics_rows if row["split"] == "val")
+    parameter_count = count_parameters(model)
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
     return {
         "model_name": model_name,
         "experiment_tag": experiment_tag,
+        "metrics_rows": metrics_rows,
         "hidden_dim": hidden_dim,
-        "parameter_count": count_parameters(model),
+        "parameter_count": parameter_count,
         "best_epoch": result["best_epoch"],
         "best_val_loss": result["best_val_loss"],
         "val_metrics": val_metrics,
+        "val_rmse_per_sample_phys": val_rmse_per_sample.tolist(),
+        "val_rmse_phys_mean": val_rmse_mean,
+        "val_rmse_phys_se": val_rmse_se,
         "test_metrics": test_metrics,
         "checkpoint_path": str(checkpoint_path),
     }
@@ -746,9 +1009,11 @@ def write_hidden_interpretation_note(path: Path, recommendation: Dict[str, objec
     multiple hidden dimensions under the same training and validation protocol. The selected recommendation is
     hidden dimension = {recommendation['recommended_hidden_dim']}, using the criterion:
     {recommendation['criterion']}
+    The hidden-dimension choice is based on validation performance only; the test split is not used for this selection.
 
     The best validation RMSE obtained anywhere in the sweep was
-    {recommendation['best_val_rmse_phys']:.6e}, achieved at hidden dimension {int(best_row['hidden_dim'])}.
+    {recommendation['best_val_rmse_phys']:.6e} +/- {recommendation['best_val_rmse_phys_se']:.3e}
+    (mean +/- standard error across validation trajectories), achieved at hidden dimension {int(best_row['hidden_dim'])}.
     The recommended smaller dimension is preferred when it already lies on the performance plateau, so increasing
     the hidden-state size further yields only marginal gains relative to the added complexity.
     """
@@ -763,6 +1028,7 @@ def write_experimental_summary(
     main_result: Dict[str, object],
     baseline_rows: List[Dict[str, object]],
     recommendation: Optional[Dict[str, object]],
+    include_baselines_in_report: bool,
 ) -> None:
     lines = [
         "Experimental summary",
@@ -783,7 +1049,7 @@ def write_experimental_summary(
             f"R^2={main_result['test_metrics']['r2_phys']:.6f}"
         ),
     ]
-    if baseline_rows:
+    if include_baselines_in_report and baseline_rows:
         lines.extend(["", "Baseline comparison (test split, physical units):"])
         for row in baseline_rows:
             lines.append(
@@ -797,9 +1063,100 @@ def write_experimental_summary(
                 "Hidden-state recommendation:",
                 f"Recommended minimum hidden dimension = {recommendation['recommended_hidden_dim']}",
                 f"Selection rule: {recommendation['criterion']}",
+                (
+                    "Sweep protocol: validation-only model selection was used; the test split was not used to "
+                    "choose hidden dimension."
+                ),
             ]
         )
     write_text(path, "\n".join(lines))
+
+
+def write_problem_submission_checklist(
+    path: Path,
+    main_result: Dict[str, object],
+    recommendation: Optional[Dict[str, object]],
+    include_baselines_in_report: bool,
+) -> None:
+    lines = [
+        "Problem 1 (a,b,c) Submission Checklist",
+        "",
+        "Scope lock:",
+        "- Assessed evidence is limited to Problem 1(a), 1(b), and 1(c) for the RNO workflow.",
+        (
+            "- Baselines are treated as out-of-scope for primary evidence."
+            if not include_baselines_in_report
+            else "- Baselines are included as optional contextual evidence only."
+        ),
+        "",
+        "Problem 1(a): constitutive input/output framing",
+        "- Artifact: report_notes/problem1a_constitutive_io.txt",
+        "- Requirement: input state (strain, strain-rate proxy) and output (stress) are explicitly stated.",
+        "",
+        "Problem 1(b): RNO design, training, and evaluation",
+        "- Artifact: tables/main_model_summary.csv",
+        f"- Main run tag: {main_result['experiment_tag']}",
+        "- Requirement: official main-model metrics include train/val/test via the dedicated main metrics artifact.",
+        "",
+        "Problem 1(c): minimum hidden/internal variables",
+        "- Artifacts: tables/hidden_state_sweep.csv, tables/hidden_state_recommendation.json, report_notes/problem1c_hidden_state_interpretation.txt",
+        "- Requirement: selection is validation-only and empirical (one-standard-error criterion).",
+        (
+            f"- Recommended minimum hidden dimension: {recommendation['recommended_hidden_dim']}"
+            if recommendation is not None
+            else "- Recommended minimum hidden dimension: not available (hidden sweep disabled)."
+        ),
+    ]
+    write_text(path, "\n".join(lines))
+
+
+def validate_submission_artifacts(
+    output_paths: Dict[str, Path],
+    main_result: Dict[str, object],
+    hidden_sweep_rows: List[Dict[str, object]],
+    recommendation: Optional[Dict[str, object]],
+) -> Dict[str, object]:
+    checks: Dict[str, object] = {
+        "main_metrics_contains_train_val_test": False,
+        "main_model_summary_matches_main_test_metrics": False,
+        "sweep_does_not_overwrite_main_tag": False,
+        "recommendation_exists": recommendation is not None,
+        "recommendation_matches_one_se_recompute": False,
+    }
+
+    main_splits = {str(row["split"]) for row in main_result["metrics_rows"]}
+    checks["main_metrics_contains_train_val_test"] = main_splits == {"train", "val", "test"}
+
+    summary_rows = list(csv.DictReader((output_paths["tables"] / "main_model_summary.csv").open("r", encoding="utf-8")))
+    if len(summary_rows) == 1:
+        row = summary_rows[0]
+        checks["main_model_summary_matches_main_test_metrics"] = (
+            row["model"] == str(main_result["experiment_tag"])
+            and abs(float(row["test_rmse_phys"]) - float(main_result["test_metrics"]["rmse_phys"])) < 1.0e-12
+            and abs(float(row["test_mae_phys"]) - float(main_result["test_metrics"]["mae_phys"])) < 1.0e-12
+            and abs(float(row["test_rel_l2_phys"]) - float(main_result["test_metrics"]["rel_l2_phys"])) < 1.0e-12
+            and abs(float(row["test_r2_phys"]) - float(main_result["test_metrics"]["r2_phys"])) < 1.0e-12
+        )
+
+    sweep_tags = {f"RNO_h{int(row['hidden_dim'])}_sweep" for row in hidden_sweep_rows}
+    checks["sweep_does_not_overwrite_main_tag"] = str(main_result["experiment_tag"]) not in sweep_tags
+
+    if recommendation is not None and hidden_sweep_rows:
+        best_row = min(hidden_sweep_rows, key=lambda row: float(row["val_rmse_phys"]))
+        threshold = float(best_row["val_rmse_phys"]) + float(best_row["val_rmse_phys_se"])
+        eligible = sorted(
+            int(row["hidden_dim"])
+            for row in hidden_sweep_rows
+            if float(row["val_rmse_phys"]) <= threshold + 1.0e-15
+        )
+        recomputed = eligible[0] if eligible else min(int(row["hidden_dim"]) for row in hidden_sweep_rows)
+        checks["recommendation_matches_one_se_recompute"] = (
+            int(recommendation["recommended_hidden_dim"]) == recomputed
+            and abs(float(recommendation["threshold_rmse_phys"]) - threshold) < 1.0e-12
+        )
+
+    checks["all_pass"] = all(bool(v) for v in checks.values())
+    return checks
 
 
 def parse_args() -> Config:
@@ -812,10 +1169,24 @@ def parse_args() -> Config:
     parser.add_argument("--hidden_dim", type=int, default=DEFAULT_CONFIG.hidden_dim)
     parser.add_argument("--downsample", type=int, default=DEFAULT_CONFIG.downsample)
     parser.add_argument("--device", type=str, default=DEFAULT_CONFIG.device)
+    parser.add_argument("--amp_dtype", type=str, default=DEFAULT_CONFIG.amp_dtype, choices=["float16", "bfloat16"])
+    parser.add_argument("--disable_amp", action="store_true")
+    parser.add_argument("--num_workers", type=int, default=DEFAULT_CONFIG.num_workers)
+    parser.add_argument("--prefetch_factor", type=int, default=DEFAULT_CONFIG.prefetch_factor)
+    parser.add_argument("--persistent_workers", action="store_true", default=DEFAULT_CONFIG.persistent_workers)
+    parser.add_argument("--disable_persistent_workers", action="store_false", dest="persistent_workers")
+    parser.add_argument("--deterministic", action="store_true", default=DEFAULT_CONFIG.deterministic)
+    parser.add_argument("--compile_model", action="store_true", default=DEFAULT_CONFIG.compile_model)
+    parser.add_argument("--disable_compile_model", action="store_false", dest="compile_model")
     parser.add_argument("--run_hidden_sweep", action="store_true", default=DEFAULT_CONFIG.run_hidden_sweep)
     parser.add_argument("--skip_hidden_sweep", action="store_false", dest="run_hidden_sweep")
     parser.add_argument("--run_baselines", action="store_true", default=DEFAULT_CONFIG.run_baselines)
     parser.add_argument("--skip_baselines", action="store_false", dest="run_baselines")
+    parser.add_argument(
+        "--include_baselines_in_report",
+        action="store_true",
+        default=DEFAULT_CONFIG.include_baselines_in_report,
+    )
     args = parser.parse_args()
 
     cfg = Config()
@@ -827,14 +1198,23 @@ def parse_args() -> Config:
     cfg.hidden_dim = args.hidden_dim
     cfg.downsample = args.downsample
     cfg.device = args.device
+    cfg.amp_dtype = args.amp_dtype
+    cfg.use_amp = not args.disable_amp
+    cfg.num_workers = args.num_workers
+    cfg.prefetch_factor = args.prefetch_factor
+    cfg.persistent_workers = args.persistent_workers
+    cfg.deterministic = args.deterministic
+    cfg.compile_model = args.compile_model
     cfg.run_hidden_sweep = args.run_hidden_sweep
     cfg.run_baselines = args.run_baselines
+    cfg.include_baselines_in_report = args.include_baselines_in_report
     return cfg
 
 
 def main() -> None:
     cfg = parse_args()
-    set_global_seed(cfg.seed)
+    set_global_seed(cfg.seed, deterministic=cfg.deterministic)
+    torch.set_float32_matmul_precision("high")
     setup_plotting()
     device = resolve_device(cfg.device)
     output_paths = ensure_dirs(Path(cfg.output_dir))
@@ -842,6 +1222,11 @@ def main() -> None:
     print(f"[{timestamp()}] Device: {device}")
     if device.type == "cuda":
         print(f"[{timestamp()}] GPU: {torch.cuda.get_device_name(device)}")
+    print(
+        f"[{timestamp()}] Throughput settings: num_workers={resolve_num_workers(cfg)} "
+        f"persistent_workers={cfg.persistent_workers} prefetch_factor={cfg.prefetch_factor} "
+        f"deterministic={cfg.deterministic} compile_model={cfg.compile_model}"
+    )
 
     reader = MatReader(cfg.data_path)
     keys = reader.keys()
@@ -897,6 +1282,7 @@ def main() -> None:
         },
     )
     save_json(output_paths["logs"] / "config.json", asdict(cfg))
+    save_json(output_paths["logs"] / "environment.json", gather_environment(device))
 
     data_summary = {
         "num_samples": num_samples,
@@ -931,12 +1317,45 @@ def main() -> None:
         hidden_dim=cfg.hidden_dim,
         epochs=cfg.epochs,
         make_figures=True,
+        evaluate_test=True,
+        tag_context="main",
     )
 
     baseline_summary_rows: List[Dict[str, object]] = []
     if cfg.run_baselines:
-        for baseline_name in ["WindowMLP", "GRU"]:
-            print(f"[{timestamp()}] Training baseline {baseline_name}")
+        target_params = int(main_result["parameter_count"])
+        width_table = []
+        tuned_mlp_width, tuned_mlp_params = tune_baseline_width("WindowMLP", cfg, target_params=target_params)
+        tuned_gru_width, tuned_gru_params = tune_baseline_width("GRU", cfg, target_params=target_params)
+        width_table.append(
+            {
+                "model": "WindowMLP",
+                "width": tuned_mlp_width,
+                "parameters": tuned_mlp_params,
+                "target_parameters": target_params,
+                "mismatch_fraction": abs(tuned_mlp_params - target_params) / max(target_params, 1),
+            }
+        )
+        width_table.append(
+            {
+                "model": "GRU",
+                "width": tuned_gru_width,
+                "parameters": tuned_gru_params,
+                "target_parameters": target_params,
+                "mismatch_fraction": abs(tuned_gru_params - target_params) / max(target_params, 1),
+            }
+        )
+        save_csv(output_paths["tables"] / "baseline_width_tuning.csv", width_table)
+
+        baseline_specs = [
+            ("WindowMLP", {"baseline_width": tuned_mlp_width}),
+            ("GRU", {"gru_width": tuned_gru_width}),
+        ]
+        for baseline_name, extra_kwargs in baseline_specs:
+            print(
+                f"[{timestamp()}] Training baseline {baseline_name} "
+                f"(fair-width setting: {width_table[0 if baseline_name == 'WindowMLP' else 1]['width']})"
+            )
             result = run_single_experiment(
                 model_name=baseline_name,
                 cfg=cfg,
@@ -950,6 +1369,9 @@ def main() -> None:
                 output_paths=output_paths,
                 epochs=cfg.epochs,
                 make_figures=False,
+                evaluate_test=True,
+                tag_context="baseline",
+                **extra_kwargs,
             )
             baseline_summary_rows.append(
                 {
@@ -978,7 +1400,8 @@ def main() -> None:
     recommendation = None
     if cfg.run_hidden_sweep:
         print(f"[{timestamp()}] Running hidden-state sweep: {cfg.hidden_sweep}")
-        for hidden_dim in cfg.hidden_sweep:
+        sweep_iter = maybe_tqdm(cfg.hidden_sweep, desc="Hidden sweep", leave=False, dynamic_ncols=True)
+        for hidden_dim in sweep_iter:
             result = run_single_experiment(
                 model_name="RNO",
                 cfg=cfg,
@@ -993,6 +1416,8 @@ def main() -> None:
                 hidden_dim=hidden_dim,
                 epochs=cfg.sweep_epochs,
                 make_figures=False,
+                evaluate_test=False,
+                tag_context="sweep",
             )
             hidden_sweep_rows.append(
                 {
@@ -1001,12 +1426,12 @@ def main() -> None:
                     "best_epoch": result["best_epoch"],
                     "best_val_loss": result["best_val_loss"],
                     "val_rmse_phys": result["val_metrics"]["rmse_phys"],
+                    "val_rmse_phys_se": result["val_rmse_phys_se"],
                     "val_rel_l2_phys": result["val_metrics"]["rel_l2_phys"],
-                    "test_rmse_phys": result["test_metrics"]["rmse_phys"],
-                    "test_rel_l2_phys": result["test_metrics"]["rel_l2_phys"],
-                    "test_r2_phys": result["test_metrics"]["r2_phys"],
                 }
             )
+            if tqdm is not None:
+                sweep_iter.set_postfix(hidden_dim=hidden_dim, val_rmse=f"{result['val_metrics']['rmse_phys']:.4e}")
         save_csv(output_paths["tables"] / "hidden_state_sweep.csv", hidden_sweep_rows)
         plot_hidden_sweep(hidden_sweep_rows, output_paths["figures"] / "hidden_state_sweep.png", cfg)
         recommendation = recommend_hidden_dimension(hidden_sweep_rows)
@@ -1025,6 +1450,7 @@ def main() -> None:
         main_result=main_result,
         baseline_rows=baseline_summary_rows,
         recommendation=recommendation,
+        include_baselines_in_report=cfg.include_baselines_in_report,
     )
 
     save_csv(
@@ -1041,6 +1467,21 @@ def main() -> None:
             }
         ],
     )
+    save_csv(output_paths["tables"] / "rno_submission_main_metrics.csv", main_result["metrics_rows"])
+
+    write_problem_submission_checklist(
+        output_paths["report_notes"] / "problem1_submission_checklist.txt",
+        main_result=main_result,
+        recommendation=recommendation,
+        include_baselines_in_report=cfg.include_baselines_in_report,
+    )
+    submission_checks = validate_submission_artifacts(
+        output_paths=output_paths,
+        main_result=main_result,
+        hidden_sweep_rows=hidden_sweep_rows,
+        recommendation=recommendation,
+    )
+    save_json(output_paths["tables"] / "submission_consistency_checks.json", submission_checks)
 
     print("")
     print("=== Coursework summary ===")
