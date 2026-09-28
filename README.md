@@ -1,9 +1,5 @@
 # Recurrent Neural Operator for Visco-Plasticity
 
-[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](pyproject.toml)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.3%2B-ee4c2c)](https://pytorch.org)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-
 A data-driven constitutive model for a 1D visco-plastic composite. A **Recurrent Neural Operator (RNO)** is trained on unit-cell simulations to map macroscopic strain history to macroscopic stress. Its recurrent hidden state acts as a set of *learned internal variables*, and a sweep over the hidden-state size estimates how many internal variables the material actually needs.
 
 <p align="center">
@@ -75,7 +71,7 @@ The hidden-state size $k$ was swept over {1, 2, 3, 4, 6, 8, 12, 16}, and each mo
   <img src="assets/hidden_state_sweep.png" alt="Validation RMSE and parameter count versus hidden-state dimension" width="70%">
 </p>
 
-## Quickstart
+## Reproducing
 
 Requires [uv](https://docs.astral.sh/uv/).
 
@@ -89,7 +85,7 @@ uv sync
 
 ### Data
 
-The training data (`viscodata_3mat.mat`) was supplied with the course and is **not redistributed** here. Place it in the repository root, or pass `--data_path`. Any MATLAB file with 2D `(samples × time)` arrays named `epsi_tol`/`sigma_tol` (or `strain`/`stress`, `epsilon`/`sigma`) will work. Both v5 and v7.3 (HDF5) formats are supported.
+The unit-cell dataset (`viscodata_3mat.mat`) is **not redistributed** here. Place it in the repository root, or pass `--data_path`. Any MATLAB file with 2D `(samples × time)` arrays named `epsi_tol`/`sigma_tol` (or `strain`/`stress`, `epsilon`/`sigma`) will work. Both v5 and v7.3 (HDF5) formats are supported.
 
 ### Train
 
@@ -115,10 +111,10 @@ outputs/
 └── checkpoints/  best-validation weights for each model
 ```
 
-## Context
+## Acknowledgements
 
-Developed for the Cambridge Engineering Tripos Part IIB module **4C11** (University of Cambridge, Department of Engineering).
+Originally developed for 4C11 Data-Driven and Learning-Based Methods in Mechanics and Materials, Department of Engineering, University of Cambridge, which also provided the unit-cell dataset.
 
-## License
+## Licence
 
 [MIT](LICENSE)
