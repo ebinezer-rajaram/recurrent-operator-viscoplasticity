@@ -1,0 +1,25 @@
+[project]
+name = "recurrent-operator-viscoplasticity"
+version = "0.1.0"
+description = "Recurrent Neural Operator surrogate for 1D visco-plastic constitutive laws, trained on unit-cell simulations."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = [
+    "h5py>=3.8",
+    "matplotlib>=3.7",
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "torch>=2.3",
+    "tqdm>=4.65",
+]
+
+[dependency-groups]
+dev = ["ruff>=0.6"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
