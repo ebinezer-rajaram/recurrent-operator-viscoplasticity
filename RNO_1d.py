@@ -1,3 +1,14 @@
+"""Recurrent Neural Operator (RNO) surrogate for 1D visco-plastic constitutive response.
+
+Learns the causal map from macroscopic strain history to macroscopic stress,
+trained on unit-cell simulations. A gated recurrent hidden state plays the role
+of learned internal variables; an optional sweep over its dimension estimates
+how many internal variables the material response needs.
+
+Usage:
+    uv run python RNO_1d.py --data_path viscodata_3mat.mat --run_hidden_sweep
+"""
+
 import argparse
 import csv
 import json
@@ -5,35 +16,10 @@ import math
 import os
 import platform
 import random
-import sys
 import time
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
-
-if any(flag in sys.argv for flag in ("-h", "--help")):
-    help_parser = argparse.ArgumentParser(description="Train a 1D recurrent neural operator constitutive model.")
-    help_parser.add_argument("--data_path", type=str, default="viscodata_3mat.mat")
-    help_parser.add_argument("--output_dir", type=str, default="outputs")
-    help_parser.add_argument("--epochs", type=int, default=140)
-    help_parser.add_argument("--sweep_epochs", type=int, default=100)
-    help_parser.add_argument("--batch_size", type=int, default=32)
-    help_parser.add_argument("--hidden_dim", type=int, default=8)
-    help_parser.add_argument("--downsample", type=int, default=2)
-    help_parser.add_argument("--device", type=str, default="auto")
-    help_parser.add_argument("--amp_dtype", type=str, default="float16", choices=["float16", "bfloat16"])
-    help_parser.add_argument("--disable_amp", action="store_true")
-    help_parser.add_argument("--num_workers", type=int, default=-1)
-    help_parser.add_argument("--prefetch_factor", type=int, default=4)
-    help_parser.add_argument("--persistent_workers", action="store_true", default=True)
-    help_parser.add_argument("--disable_persistent_workers", action="store_false", dest="persistent_workers")
-    help_parser.add_argument("--deterministic", action="store_true", default=False)
-    help_parser.add_argument("--compile_model", action="store_true", default=True)
-    help_parser.add_argument("--disable_compile_model", action="store_false", dest="compile_model")
-    help_parser.add_argument("--run_hidden_sweep", action="store_true", default=False)
-    help_parser.add_argument("--skip_hidden_sweep", action="store_false", dest="run_hidden_sweep")
-    help_parser.print_help()
-    sys.exit(0)
 
 try:
     import h5py
@@ -43,9 +29,6 @@ try:
     from tqdm import tqdm
 except ImportError:
     tqdm = None
-import matplotlib
-
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -74,7 +57,7 @@ class Config:
     use_amp: bool = True
     amp_dtype: str = "float16"
     hidden_dim: int = 8
-    hidden_sweep: Tuple[int, ...] = (1, 2, 3, 4, 6, 8, 12, 16)
+    hidden_sweep: tuple[int, ...] = (1, 2, 3, 4, 6, 8, 12, 16)
     run_hidden_sweep: bool = False
     num_workers: int = -1
     prefetch_factor: int = 4
@@ -105,10 +88,7 @@ def set_global_seed(seed: int, deterministic: bool) -> None:
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = bool(deterministic)
     torch.backends.cudnn.benchmark = not bool(deterministic)
-    try:
-        torch.use_deterministic_algorithms(bool(deterministic))
-    except Exception:
-        pass
+    torch.use_deterministic_algorithms(bool(deterministic))
 
 
 def resolve_num_workers(cfg: Config) -> int:
@@ -121,13 +101,7 @@ def resolve_num_workers(cfg: Config) -> int:
 def maybe_compile_model(model: nn.Module, cfg: Config, device: torch.device) -> nn.Module:
     if not cfg.compile_model or device.type != "cuda":
         return model
-    if not hasattr(torch, "compile"):
-        return model
-    try:
-        return torch.compile(model, mode="reduce-overhead")
-    except Exception as exc:
-        print(f"[{timestamp()}] Warning: torch.compile failed ({exc}). Falling back to eager mode.")
-        return model
+    return torch.compile(model, mode="reduce-overhead")
 
 
 def resolve_device(device_arg: str) -> torch.device:
@@ -149,7 +123,7 @@ def supports_bfloat16(device: torch.device) -> bool:
     return bool(device.type == "cuda" and torch.cuda.is_bf16_supported())
 
 
-def ensure_dirs(output_dir: Path) -> Dict[str, Path]:
+def ensure_dirs(output_dir: Path) -> dict[str, Path]:
     paths = {
         "root": output_dir,
         "figures": output_dir / "figures",
@@ -162,11 +136,11 @@ def ensure_dirs(output_dir: Path) -> Dict[str, Path]:
     return paths
 
 
-def save_json(path: Path, payload: Dict) -> None:
+def save_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def save_csv(path: Path, rows: List[Dict[str, object]], fieldnames: Optional[List[str]] = None) -> None:
+def save_csv(path: Path, rows: list[dict[str, object]], fieldnames: list[str] | None = None) -> None:
     if not rows:
         return
     if fieldnames is None:
@@ -185,7 +159,7 @@ def timestamp() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def gather_environment(device: torch.device) -> Dict[str, object]:
+def gather_environment(device: torch.device) -> dict[str, object]:
     env = {
         "python_version": platform.python_version(),
         "platform": platform.platform(),
@@ -215,19 +189,19 @@ class MatReader:
 
             self.data = scipy.io.loadmat(self.file_path)
             self.old_mat = True
-        except NotImplementedError:
+        except NotImplementedError as exc:
             if h5py is None:
                 raise ImportError(
                     "scipy.io.loadmat could not read the MATLAB file and h5py is not installed for HDF5 fallback."
-                )
+                ) from exc
             self.data = h5py.File(self.file_path, "r")
             self.old_mat = False
         except ImportError as exc:
             raise ImportError(
-                "scipy is required to read MATLAB data. Install with `pip install scipy`."
+                "scipy is required to read MATLAB data. Install project dependencies with `uv sync`."
             ) from exc
 
-    def keys(self) -> List[str]:
+    def keys(self) -> list[str]:
         if self.old_mat:
             return [key for key in self.data.keys() if not key.startswith("__")]
         return list(self.data.keys())
@@ -242,7 +216,7 @@ class MatReader:
         return np.asarray(array, dtype=np.float32)
 
 
-def infer_signal_fields(reader: MatReader) -> Tuple[str, str]:
+def infer_signal_fields(reader: MatReader) -> tuple[str, str]:
     keys = reader.keys()
     lower_map = {key.lower(): key for key in keys}
     strain_candidates = ["epsi_tol", "epsilon", "eps", "strain", "macro_strain"]
@@ -264,8 +238,8 @@ def validate_signals(strain: np.ndarray, stress: np.ndarray) -> None:
 class StandardScaler:
     def __init__(self, eps: float = 1.0e-6):
         self.eps = eps
-        self.mean: Optional[np.ndarray] = None
-        self.std: Optional[np.ndarray] = None
+        self.mean: np.ndarray | None = None
+        self.std: np.ndarray | None = None
 
     def fit(self, data: np.ndarray) -> None:
         self.mean = data.mean(axis=0, keepdims=True)
@@ -282,14 +256,14 @@ class StandardScaler:
             raise RuntimeError("Scaler must be fit before inverse_transform.")
         return data * self.std + self.mean
 
-    def state_dict(self) -> Dict[str, List[float]]:
+    def state_dict(self) -> dict[str, list[float]]:
         return {
             "mean": np.asarray(self.mean).reshape(-1).tolist(),
             "std": np.asarray(self.std).reshape(-1).tolist(),
         }
 
 
-def make_splits(num_samples: int, cfg: Config) -> Dict[str, np.ndarray]:
+def make_splits(num_samples: int, cfg: Config) -> dict[str, np.ndarray]:
     if not math.isclose(cfg.train_fraction + cfg.val_fraction + cfg.test_fraction, 1.0, abs_tol=1.0e-8):
         raise ValueError("Train/validation/test fractions must sum to 1.")
     rng = np.random.default_rng(cfg.seed)
@@ -298,12 +272,12 @@ def make_splits(num_samples: int, cfg: Config) -> Dict[str, np.ndarray]:
     n_train = int(round(cfg.train_fraction * num_samples))
     n_val = int(round(cfg.val_fraction * num_samples))
     train_idx = np.sort(indices[:n_train])
-    val_idx = np.sort(indices[n_train:n_train + n_val])
-    test_idx = np.sort(indices[n_train + n_val:])
+    val_idx = np.sort(indices[n_train : n_train + n_val])
+    test_idx = np.sort(indices[n_train + n_val :])
     return {"train": train_idx, "val": val_idx, "test": test_idx}
 
 
-def save_split_indices(path: Path, splits: Dict[str, np.ndarray]) -> None:
+def save_split_indices(path: Path, splits: dict[str, np.ndarray]) -> None:
     rows = []
     for split_name, indices in splits.items():
         for idx in indices.tolist():
@@ -314,7 +288,7 @@ def save_split_indices(path: Path, splits: Dict[str, np.ndarray]) -> None:
 class MLP(nn.Module):
     def __init__(self, widths: Sequence[int], activation: nn.Module = nn.GELU):
         super().__init__()
-        layers: List[nn.Module] = []
+        layers: list[nn.Module] = []
         for i in range(len(widths) - 1):
             layers.append(nn.Linear(widths[i], widths[i + 1]))
             if i < len(widths) - 2:
@@ -344,7 +318,7 @@ class RecurrentNeuralOperator1D(nn.Module):
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         batch_size, time_steps, _ = features.shape
         hidden = self.init_hidden(batch_size, features.device)
-        outputs: List[torch.Tensor] = []
+        outputs: list[torch.Tensor] = []
         prev_stress = self.initial_head(torch.cat([features[:, 0, :], hidden], dim=-1))
 
         for t in range(time_steps):
@@ -375,7 +349,7 @@ def create_loader(
     indices: np.ndarray,
     cfg: Config,
     shuffle: bool,
-    batch_size: Optional[int] = None,
+    batch_size: int | None = None,
 ) -> DataLoader:
     dataset = TensorDataset(
         torch.from_numpy(features[indices]).float(),
@@ -430,7 +404,7 @@ def train_model(
     cfg: Config,
     checkpoint_path: Path,
     epochs: int,
-) -> Dict[str, object]:
+) -> dict[str, object]:
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
@@ -448,10 +422,7 @@ def train_model(
     if amp_dtype == torch.bfloat16 and not supports_bfloat16(device):
         amp_dtype = torch.float16
     scaler_enabled = use_amp_train and amp_dtype == torch.float16
-    try:
-        scaler = torch.amp.GradScaler(device.type, enabled=scaler_enabled)
-    except Exception:
-        scaler = torch.cuda.amp.GradScaler(enabled=scaler_enabled)
+    scaler = torch.amp.GradScaler(device.type, enabled=scaler_enabled)
 
     epoch_iter = maybe_tqdm(range(1, epochs + 1), desc="Training epochs", leave=False, dynamic_ncols=True)
     for epoch in epoch_iter:
@@ -498,7 +469,10 @@ def train_model(
             best_val = val_loss
             best_epoch = epoch
             patience_counter = 0
-            torch.save({"model_state": model.state_dict(), "best_val_loss": best_val, "best_epoch": best_epoch}, checkpoint_path)
+            torch.save(
+                {"model_state": model.state_dict(), "best_val_loss": best_val, "best_epoch": best_epoch},
+                checkpoint_path,
+            )
         else:
             patience_counter += 1
 
@@ -539,20 +513,20 @@ def collect_predictions(
     use_amp_eval = bool(use_amp and device.type == "cuda")
     with torch.no_grad():
         for start in range(0, len(features), batch_size):
-            batch = torch.from_numpy(features[start:start + batch_size]).float().to(device, non_blocking=True)
+            batch = torch.from_numpy(features[start : start + batch_size]).float().to(device, non_blocking=True)
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp_eval):
                 pred = model(batch)
             outputs.append(pred.cpu().numpy())
     return np.concatenate(outputs, axis=0)
 
 
-def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
+def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
     diff = y_pred - y_true
-    mse = float(np.mean(diff ** 2))
+    mse = float(np.mean(diff**2))
     rmse = float(np.sqrt(mse))
     mae = float(np.mean(np.abs(diff)))
     rel_l2 = float(np.linalg.norm(diff) / (np.linalg.norm(y_true) + 1.0e-12))
-    ss_res = float(np.sum(diff ** 2))
+    ss_res = float(np.sum(diff**2))
     ss_tot = float(np.sum((y_true - np.mean(y_true)) ** 2))
     r2 = float(1.0 - ss_res / (ss_tot + 1.0e-12))
     return {"mse": mse, "rmse": rmse, "mae": mae, "rel_l2": rel_l2, "r2": r2}
@@ -568,7 +542,9 @@ def compute_per_sample_rmse(y_true: np.ndarray, y_pred: np.ndarray) -> np.ndarra
     return np.sqrt(np.mean((y_pred - y_true) ** 2, axis=1))
 
 
-def summarise_split_metrics(y_true_norm: np.ndarray, y_pred_norm: np.ndarray, stress_scaler: StandardScaler) -> Dict[str, float]:
+def summarise_split_metrics(
+    y_true_norm: np.ndarray, y_pred_norm: np.ndarray, stress_scaler: StandardScaler
+) -> dict[str, float]:
     # Report both normalized-space errors (optimization scale) and physical-space errors (engineering scale).
     y_true_phys = inverse_stress(y_true_norm, stress_scaler)
     y_pred_phys = inverse_stress(y_pred_norm, stress_scaler)
@@ -583,6 +559,7 @@ def summarise_split_metrics(y_true_norm: np.ndarray, y_pred_norm: np.ndarray, st
 
 
 def setup_plotting() -> None:
+    plt.switch_backend("Agg")
     plt.style.use("seaborn-v0_8-whitegrid")
     plt.rcParams.update(
         {
@@ -606,7 +583,7 @@ def save_figure(fig: plt.Figure, path_png: Path, save_pdf: bool, dpi: int) -> No
     plt.close(fig)
 
 
-def plot_loss_curves(history: Dict[str, List[float]], title: str, out_path: Path, cfg: Config) -> None:
+def plot_loss_curves(history: dict[str, list[float]], title: str, out_path: Path, cfg: Config) -> None:
     fig, ax = plt.subplots()
     ax.plot(history["epoch"], history["train_loss"], label="Train loss")
     ax.plot(history["epoch"], history["val_loss"], label="Validation loss")
@@ -628,7 +605,7 @@ def plot_trajectory_examples(
     fig_dir: Path,
     cfg: Config,
 ) -> None:
-    for sample_index, label in zip(sample_indices, labels):
+    for sample_index, label in zip(sample_indices, labels, strict=True):
         fig, axes = plt.subplots(1, 3, figsize=(14.0, 4.0))
         pred = stress_pred_phys[sample_index]
         truth = stress_true_phys[sample_index]
@@ -650,7 +627,9 @@ def plot_trajectory_examples(
         axes[2].set_xlabel("Normalised time")
         axes[2].set_ylabel("Prediction residual")
         axes[2].set_title(f"{label.capitalize()} case: residual")
-        save_figure(fig, fig_dir / f"{prefix}_{label}_sample_{sample_index:03d}.png", cfg.save_pdf_figures, cfg.figure_dpi)
+        save_figure(
+            fig, fig_dir / f"{prefix}_{label}_sample_{sample_index:03d}.png", cfg.save_pdf_figures, cfg.figure_dpi
+        )
 
 
 def plot_parity(y_true_phys: np.ndarray, y_pred_phys: np.ndarray, out_path: Path, cfg: Config) -> None:
@@ -675,7 +654,7 @@ def plot_parity(y_true_phys: np.ndarray, y_pred_phys: np.ndarray, out_path: Path
     save_figure(fig, out_path, cfg.save_pdf_figures, cfg.figure_dpi)
 
 
-def plot_hidden_sweep(rows: List[Dict[str, object]], out_path: Path, cfg: Config) -> None:
+def plot_hidden_sweep(rows: list[dict[str, object]], out_path: Path, cfg: Config) -> None:
     dims = [int(row["hidden_dim"]) for row in rows]
     val_rmse = [float(row["val_rmse_phys"]) for row in rows]
     val_se = [float(row["val_rmse_phys_se"]) for row in rows]
@@ -694,7 +673,7 @@ def plot_hidden_sweep(rows: List[Dict[str, object]], out_path: Path, cfg: Config
     save_figure(fig, out_path, cfg.save_pdf_figures, cfg.figure_dpi)
 
 
-def select_representative_samples(relative_errors: np.ndarray) -> Tuple[List[int], List[str]]:
+def select_representative_samples(relative_errors: np.ndarray) -> tuple[list[int], list[str]]:
     ordering = np.argsort(relative_errors)
     best = int(ordering[0])
     median = int(ordering[len(ordering) // 2])
@@ -702,7 +681,7 @@ def select_representative_samples(relative_errors: np.ndarray) -> Tuple[List[int
     return [best, median, worst], ["best", "median", "worst"]
 
 
-def recommend_hidden_dimension(sweep_rows: List[Dict[str, object]]) -> Dict[str, object]:
+def recommend_hidden_dimension(sweep_rows: list[dict[str, object]]) -> dict[str, object]:
     if not sweep_rows:
         raise ValueError("Hidden-state sweep rows are required for recommendation.")
     best_row = min(sweep_rows, key=lambda row: float(row["val_rmse_phys"]))
@@ -724,7 +703,7 @@ def recommend_hidden_dimension(sweep_rows: List[Dict[str, object]]) -> Dict[str,
     }
 
 
-def instantiate_model(cfg: Config, hidden_dim: Optional[int] = None) -> nn.Module:
+def instantiate_model(cfg: Config, hidden_dim: int | None = None) -> nn.Module:
     return RecurrentNeuralOperator1D(feature_dim=2, hidden_dim=hidden_dim or cfg.hidden_dim, width=cfg.rno_width)
 
 
@@ -736,14 +715,14 @@ def run_single_experiment(
     stress_scaler: StandardScaler,
     strain_phys: np.ndarray,
     time_axis: np.ndarray,
-    splits: Dict[str, np.ndarray],
-    output_paths: Dict[str, Path],
-    hidden_dim: Optional[int] = None,
-    epochs: Optional[int] = None,
+    splits: dict[str, np.ndarray],
+    output_paths: dict[str, Path],
+    hidden_dim: int | None = None,
+    epochs: int | None = None,
     make_figures: bool = True,
     evaluate_test: bool = True,
-    tag_context: Optional[str] = None,
-) -> Dict[str, object]:
+    tag_context: str | None = None,
+) -> dict[str, object]:
     model = instantiate_model(cfg, hidden_dim=hidden_dim).to(device)
     model = maybe_compile_model(model, cfg, device)
     experiment_tag = "RNO" if hidden_dim is None else f"RNO_h{hidden_dim}"
@@ -800,6 +779,7 @@ def run_single_experiment(
                 result["history"]["train_loss"],
                 result["history"]["val_loss"],
                 result["history"]["lr"],
+                strict=True,
             )
         ],
     )
@@ -840,7 +820,11 @@ def run_single_experiment(
     val_true_phys = inverse_stress(predictions["val"]["y_true_norm"], stress_scaler)
     val_rmse_per_sample = compute_per_sample_rmse(val_true_phys, val_pred_phys)
     val_rmse_mean = float(val_rmse_per_sample.mean())
-    val_rmse_se = float(val_rmse_per_sample.std(ddof=1) / math.sqrt(max(1, len(val_rmse_per_sample)))) if len(val_rmse_per_sample) > 1 else 0.0
+    val_rmse_se = (
+        float(val_rmse_per_sample.std(ddof=1) / math.sqrt(max(1, len(val_rmse_per_sample))))
+        if len(val_rmse_per_sample) > 1
+        else 0.0
+    )
 
     test_metrics = next((row for row in metrics_rows if row["split"] == "test"), None)
     val_metrics = next(row for row in metrics_rows if row["split"] == "val")
@@ -1011,7 +995,7 @@ def main() -> None:
         tag_context="main",
     )
 
-    hidden_sweep_rows: List[Dict[str, object]] = []
+    hidden_sweep_rows: list[dict[str, object]] = []
     recommendation = None
     if cfg.run_hidden_sweep:
         print(f"[{timestamp()}] Running hidden-state sweep: {cfg.hidden_sweep}")
@@ -1065,10 +1049,9 @@ def main() -> None:
             }
         ],
     )
-    save_csv(output_paths["tables"] / "rno_submission_main_metrics.csv", main_result["metrics_rows"])
 
     print("")
-    print("=== Coursework summary ===")
+    print("=== Summary ===")
     print(
         f"Best RNO test performance: RMSE={main_result['test_metrics']['rmse_phys']:.6e}, "
         f"MAE={main_result['test_metrics']['mae_phys']:.6e}, "
